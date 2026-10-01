@@ -57,9 +57,16 @@ that — no risk. Do not tighten the interval below ~2 minutes without raising t
 | Token works? | ✅ | ❌ — returns `401`, the app has never seen that token |
 | Session life | Permanent until rotated | `SESSION_DAYS=14`, then re-login |
 
-The agent cannot reach client, money or commission data with the status token. That
-requires a logged-in account — which is the open decision in
-`command-center-guide.md` §5.
+**`/api/business-status` uses the same token as `/api/status`** — one vault entry, one
+rotation, both endpoints. It is served by nginx from a generated file exactly like
+`/api/status`, so it is not affected by the dashboard's session auth at all.
+
+One deliberate difference: `/api/business-status` accepts the **header form only**. There is
+no `?token=` fallback, because this file carries financial data and a query-string token
+would be written to the access log.
+
+The agent still cannot reach the dashboard *app* with this token — but it no longer needs
+to, because the business figures now arrive through `/api/business-status`.
 
 ---
 
@@ -81,17 +88,26 @@ Two further wrinkles:
 - `support` is the lowest-privilege role, but it carries `view_all_clients: false` and no
   `finance` or `commissions` — so it cannot see most of what Boss asked the agent to watch.
 
-### Recommended path: extend the pattern that already works
+### Resolution: a read-only endpoint was built instead — BUILT AND LIVE
 
-Rather than create a write-capable login, generate a second read-only JSON file the same
-way `status.json` is produced, exposing only the business figures the agent needs
-(client health colours, unpaid invoice count, pending payouts, new critical alerts), and
-serve it at `/api/business-status` behind its own token.
+No account was created. `/api/business-status` was built on 2026-10-01 following the same
+pattern as `status.json`:
 
-This inherits every property that makes the current setup safe: **physically incapable of
-writing**, no session to expire, no password to rotate, no browser automation needed, and
-the agent's existing polling code barely changes. It is strictly better than a login for a
-monitoring agent.
+| | |
+|---|---|
+| Collector | `/usr/local/sbin/jakisai-business-collect` |
+| Schedule | `jakisai-business.timer` → `.service`, every 10 min |
+| Output | `/var/lib/jakisai-status/business.json` (~9 KB, ~0.1 s) |
+| DB access | `sqlite mode=ro` — **writes refused by SQLite itself** |
+| Hardening | `ProtectSystem=strict`, `ReadWritePaths=/var/lib/jakisai-status`, `NoNewPrivileges` |
+| nginx backup | `/root/nginx-backup-20261001-business/` |
+
+Verified after reload: no token → `401`, wrong token → `401`, correct header → `200`,
+`?token=` → `401` (by design). Both `/api/status` and the dashboard login page were
+re-tested and still return `200`.
+
+This has every property a login lacks: **physically incapable of writing**, no session to
+expire, no password, no browser automation, and no prompt-injection surface.
 
 ---
 
@@ -100,5 +116,10 @@ monitoring agent.
 A browser-automation agent with a dashboard login has every page it renders inside its
 prompt-injection surface — client names, notes, uploaded document titles, message bodies.
 If any of that is attacker-influenced (a client-submitted form, an inbound DM), it becomes
-instruction-adjacent text in front of an agent holding write access. The read-only JSON
-endpoint above removes this concern entirely; a login does not.
+instruction-adjacent text in front of an agent holding write access.
+
+The endpoint that was built avoids this entirely: it serves a fixed set of numbers and
+names the collector chose, never free-text fields a third party can write into. Client
+contact details and document contents are excluded by design. Keep it that way — if a
+future check adds client `notes` or message bodies to the feed, that reintroduces the
+problem.

@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""JakisAI business status snapshot for the read-only monitoring API.
+
+Serves GET https://ops.jakisai.com/api/business-status
+
+Companion to jakisai-status-collect, which covers infrastructure only. This one
+covers what the Command Center dashboard shows and /api/status does not: clients
+as customers, money, commissions, documents and staff.
+
+Opens the Command Center database READ-ONLY (sqlite mode=ro); writes are refused
+by SQLite itself, not merely by convention. Deploy target:
+/usr/local/sbin/jakisai-business-collect
+"""
+import json
+import os
+import socket
+import sqlite3
+import time
+
+VERSION = '1.0 (2026-10-01)'
+DB = '/var/lib/jakisai-command-center/jakisai.sqlite'
+OUT = '/var/lib/jakisai-status/business.json'
+NOW = time.time()
+RANK = {'ok': 0, 'unknown': 1, 'warning': 1, 'critical': 2}
+
+checks = []
+
+
+def iso(ts):
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(ts))
+
+
+def today():
+    return time.strftime('%Y-%m-%d', time.gmtime(NOW))
+
+
+def add(cid, name, priority, status, value, healthy, warning=None, critical=None, details=None):
+    c = {'id': cid, 'name': name, 'priority': priority, 'status': status,
+         'value': value, 'healthy_when': healthy}
+    if warning:
+        c['warning_when'] = warning
+    if critical:
+        c['critical_when'] = critical
+    if details is not None:
+        c['details'] = details
+    checks.append(c)
+
+
+def peso(n):
+    return round(float(n or 0), 2)
+
+
+class DB_:
+    """Read-only cursor with a per-check guard so one schema surprise cannot
+    take the whole snapshot down."""
+
+    def __init__(self, path):
+        self.con = sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=10)
+        self.con.row_factory = sqlite3.Row
+
+    def all(self, sql, *a):
+        return [dict(r) for r in self.con.execute(sql, a).fetchall()]
+
+    def one(self, sql, *a):
+        r = self.con.execute(sql, a).fetchone()
+        return dict(r) if r else {}
+
+    def val(self, sql, *a, default=0):
+        r = self.con.execute(sql, a).fetchone()
+        return r[0] if r and r[0] is not None else default
+
+
+def guard(cid, name, priority, fn):
+    try:
+        fn()
+    except Exception as e:  # noqa: BLE001 - a broken check must not break the file
+        add(cid, name, priority, 'unknown', f'check failed: {type(e).__name__}: {e}',
+            'the check runs without error')
+
+
+# ------------------------------------------------------------------ checks
+def check_subscriptions(d):
+    rows = d.all("SELECT id,name,status,monthly_fee,next_due_date,grace_days "
+                 "FROM clients WHERE status IN ('active','past_due','paused')")
+    past_due = [r for r in rows if r['status'] == 'past_due']
+    paused = [r for r in rows if r['status'] == 'paused']
+    bad = past_due + paused
+    status = 'critical' if bad else 'ok'
+    value = (f"{len(past_due)} past due, {len(paused)} paused of {len(rows)} subscriptions"
+             if bad else f"all {len(rows)} subscriptions current")
+    add('subscriptions', 'Client subscriptions', 1, status, value,
+        'no client is past_due or paused',
+        critical='any client is past_due or paused',
+        details={'past_due': [{'name': r['name'], 'due': r['next_due_date'],
+                               'monthly_fee': peso(r['monthly_fee'])} for r in past_due],
+                 'paused': [{'name': r['name'], 'due': r['next_due_date']} for r in paused],
+                 'total': len(rows)})
+
+
+def check_payouts(d):
+    n = d.val("SELECT COUNT(*) FROM payout_requests WHERE status='pending'")
+    amt = d.val("SELECT COALESCE(SUM(amount),0) FROM payout_requests WHERE status='pending'")
+    add('payouts_pending', 'Payout requests awaiting Owner', 1,
+        'warning' if n else 'ok',
+        f"{n} pending (PHP {peso(amt)})" if n else 'none pending',
+        'no payout request is pending',
+        warning='any payout is pending — only the Owner can approve, so it blocks Boss personally',
+        details={'count': n, 'amount': peso(amt)})
+
+
+def check_alerts(d):
+    # Count is saturated and useless as a signal; expose IDs so the agent diffs.
+    sev = d.all("SELECT severity, COUNT(*) c FROM alerts WHERE COALESCE(is_read,0)=0 "
+                "GROUP BY severity")
+    by = {r['severity']: r['c'] for r in sev}
+    recent = d.all("SELECT id,severity,title,created_at FROM alerts "
+                   "WHERE COALESCE(is_read,0)=0 AND severity IN ('critical','danger') "
+                   "ORDER BY created_at DESC LIMIT 25")
+    crit = by.get('critical', 0) + by.get('danger', 0)
+    add('alerts', 'Unresolved alerts', 1, 'critical' if by.get('critical') else
+        ('warning' if by.get('danger') else 'ok'),
+        f"{crit} critical/danger, {sum(by.values())} unread in total",
+        'no unread critical or danger alert',
+        warning='any danger alert', critical='any critical alert',
+        details={'by_severity': by,
+                 'open_critical_or_danger': recent,
+                 'note': 'Diff open_critical_or_danger by id. The total unread count is '
+                         'saturated (alerts are not being cleared) and must not be alerted on.'})
+
+
+def check_invoices(d):
+    n = d.val("SELECT COUNT(*) FROM invoices WHERE status='unpaid'")
+    amt = d.val("SELECT COALESCE(SUM(amount),0) FROM invoices WHERE status='unpaid'")
+    stale = d.all("SELECT i.id,i.amount,i.due_date,c.name client FROM invoices i "
+                  "LEFT JOIN clients c ON c.id=i.client_id "
+                  "WHERE i.status='unpaid' AND i.due_date < ? ORDER BY i.due_date", today())
+    add('unpaid_invoices', 'Unpaid invoices', 2,
+        'warning' if stale else ('warning' if n > 3 else 'ok'),
+        f"{n} unpaid (PHP {peso(amt)}); {len(stale)} past their due date",
+        'no unpaid invoice is past its due date',
+        warning='any unpaid invoice is past due, or more than 3 are open',
+        details={'count': n, 'amount': peso(amt), 'past_due': stale[:20]})
+
+
+def check_profitability(d):
+    rows = d.all("""
+        SELECT c.id, c.name,
+          COALESCE((SELECT SUM(amount) FROM payments p WHERE p.client_id=c.id),0) rev,
+          COALESCE((SELECT SUM(amount) FROM expenses e WHERE e.client_id=c.id),0) exp,
+          COALESCE((SELECT SUM(amount) FROM commission_entries ce
+                    WHERE ce.client_id=c.id AND ce.recipient_type!='company'),0) comm
+        FROM clients c WHERE c.status IN ('active','past_due')""")
+    losing = []
+    for r in rows:
+        profit = r['rev'] - r['exp'] - r['comm']
+        if r['rev'] > 0 and profit < 0:
+            losing.append({'name': r['name'], 'profit': peso(profit),
+                           'revenue': peso(r['rev'])})
+    add('profitability', 'Client profitability', 2,
+        'warning' if losing else 'ok',
+        f"{len(losing)} of {len(rows)} clients losing money" if losing
+        else f"all {len(rows)} clients profitable",
+        'every client with revenue has positive profit',
+        warning='any client with revenue is at a loss',
+        details={'losing_money': losing})
+
+
+def check_systems(d):
+    red = d.all("SELECT s.client_id, c.name client FROM systems s "
+                "LEFT JOIN clients c ON c.id=s.client_id "
+                "WHERE s.is_active=1 AND s.status='red'")
+    yellow = d.val("SELECT COUNT(*) FROM systems WHERE is_active=1 AND status='yellow'")
+    add('client_systems', 'Connected client systems', 2,
+        'critical' if red else ('warning' if yellow else 'ok'),
+        f"{len(red)} red, {yellow} yellow",
+        'no connected system is red or yellow',
+        warning='any system is yellow', critical='any system is red',
+        details={'red': red, 'yellow_count': yellow})
+
+
+def check_tasks(d):
+    n = d.val("SELECT COUNT(*) FROM tasks WHERE status NOT IN ('completed','cancelled') "
+              "AND due_date IS NOT NULL AND due_date < ?", today())
+    add('overdue_tasks', 'Overdue tasks', 3, 'warning' if n else 'ok',
+        f"{n} overdue", 'no task is past its due date', warning='any task is overdue',
+        details={'count': n})
+
+
+def check_staff(d):
+    rows = d.all("SELECT username,name,role,is_active,must_change_password,last_login "
+                 "FROM users ORDER BY role,username")
+    never = [r['username'] for r in rows if not r['last_login']]
+    add('staff_accounts', 'Staff accounts', 3, 'ok',
+        f"{len(rows)} accounts ({sum(1 for r in rows if r['is_active'])} active)",
+        'the account list matches what Boss expects',
+        warning='an account appears, changes role, or is created and never used',
+        details={'accounts': rows, 'never_logged_in': never,
+                 'note': 'Report any change to this list. A new account is a security '
+                         'event, not a routine change.'})
+
+
+def check_documents(d):
+    n = d.val('SELECT COUNT(*) FROM documents')
+    recent = d.val("SELECT COUNT(*) FROM documents WHERE created_at >= ?",
+                   iso(NOW - 7 * 86400))
+    add('documents', 'Client documents', 3, 'ok', f"{n} stored, {recent} added in 7 days",
+        'documents accumulate normally', details={'total': n, 'last_7_days': recent})
+
+
+def money_summary(d):
+    return {
+        'revenue_all_time': peso(d.val('SELECT COALESCE(SUM(amount),0) FROM payments')),
+        'expenses_all_time': peso(d.val('SELECT COALESCE(SUM(amount),0) FROM expenses')),
+        'commissions_to_people': peso(d.val(
+            "SELECT COALESCE(SUM(amount),0) FROM commission_entries "
+            "WHERE recipient_type!='company'")),
+        'unpaid_invoice_total': peso(d.val(
+            "SELECT COALESCE(SUM(amount),0) FROM invoices WHERE status='unpaid'")),
+        'monthly_recurring_active': peso(d.val(
+            "SELECT COALESCE(SUM(monthly_fee),0) FROM clients WHERE status='active'")),
+        'monthly_recurring_at_risk': peso(d.val(
+            "SELECT COALESCE(SUM(monthly_fee),0) FROM clients "
+            "WHERE status IN ('past_due','paused')")),
+    }
+
+
+def main():
+    try:
+        d = DB_(DB)
+    except Exception as e:  # noqa: BLE001
+        doc = {'service': 'JakisAI business status (read-only)',
+               'generated_at': iso(NOW), 'overall': 'unknown',
+               'summary': f'Cannot read the Command Center database: {e}',
+               'checks': [], 'collector': {'version': VERSION}}
+        write(doc)
+        return
+
+    guard('subscriptions', 'Client subscriptions', 1, lambda: check_subscriptions(d))
+    guard('payouts_pending', 'Payout requests awaiting Owner', 1, lambda: check_payouts(d))
+    guard('alerts', 'Unresolved alerts', 1, lambda: check_alerts(d))
+    guard('unpaid_invoices', 'Unpaid invoices', 2, lambda: check_invoices(d))
+    guard('profitability', 'Client profitability', 2, lambda: check_profitability(d))
+    guard('client_systems', 'Connected client systems', 2, lambda: check_systems(d))
+    guard('overdue_tasks', 'Overdue tasks', 3, lambda: check_tasks(d))
+    guard('staff_accounts', 'Staff accounts', 3, lambda: check_staff(d))
+    guard('documents', 'Client documents', 3, lambda: check_documents(d))
+
+    p12 = [c for c in checks if c['priority'] in (1, 2)]
+    overall = max((c['status'] for c in p12), key=lambda s: RANK.get(s, 1), default='ok')
+    problems = [c for c in p12 if c['status'] != 'ok']
+    minor = [c for c in checks if c['priority'] == 3 and c['status'] != 'ok']
+    summary = ('All priority 1 and 2 checks are OK.' if not problems else
+               ' | '.join(f"{c['status'].upper()} {c['name']}: {c['value']}" for c in problems))
+    counts = {s: sum(1 for c in checks if c['status'] == s)
+              for s in ('ok', 'warning', 'critical', 'unknown')}
+
+    try:
+        money = money_summary(d)
+    except Exception as e:  # noqa: BLE001
+        money = {'error': str(e)}
+
+    write({
+        'service': 'JakisAI business status (read-only)',
+        'server': {'name': 'JakisAI main VPS (DigitalOcean, Singapore)',
+                   'hostname': socket.gethostname()},
+        'source': 'JakisAI Command Center (ops.jakisai.com) database, opened read-only',
+        'generated_at': iso(NOW),
+        'refresh_every_minutes': 10,
+        'stale_if_older_than_minutes': 30,
+        'overall': overall,
+        'summary': summary,
+        'minor_issues': [f"{c['name']}: {c['value']}" for c in minor],
+        'counts': counts,
+        'how_to_read': (
+            'Companion to /api/status, which covers infrastructure only. overall = the worst '
+            'status among the priority 1 and 2 checks. Priority 1: look every run and tell Boss '
+            'right away when it is not ok. Priority 2: tell Boss the same day. Priority 3: weekly '
+            'summary only. For alerts, diff details.open_critical_or_danger by id — never alert on '
+            'a total count. If generated_at is older than 30 minutes, this collector has stopped: '
+            'report that.'),
+        'money': money,
+        'checks': checks,
+        'not_covered': [
+            'Whether money actually arrived in the bank or e-wallet; only what has been recorded '
+            'as a payment in the Command Center.',
+            'Payment screenshots and client replies sent through Telegram or social DMs.',
+            'Infrastructure health — that is /api/status, which this does not duplicate.',
+            'Anything a staff member has not yet entered: this reflects the records, not reality.',
+            'Client contact details (email, phone) and document contents are deliberately '
+            'excluded from this file.'],
+        'collector': {'version': VERSION, 'seconds': round(time.time() - NOW, 2)},
+    })
+
+
+def write(doc):
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    tmp = OUT + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(doc, f, indent=1)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, OUT)
+
+
+if __name__ == '__main__':
+    main()

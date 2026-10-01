@@ -7,13 +7,26 @@
 
 ## 0. ACCESS STATUS — READ FIRST
 
-**No agent login exists yet, and it is deliberately not created.** The Command Center
-has roles but **does not support read-only access**. See `token-policy.md` §3 and the
-"Why no account yet" section at the bottom. Until Boss decides, the agent's only
-sanctioned source stays `GET /api/status`, which already works.
+**No dashboard login exists, and none is needed.** The Command Center has roles but
+**cannot do read-only** (see §5). Instead a second read-only endpoint was built:
 
-Everything below is accurate about what the dashboard *shows* and is usable the moment
-access is granted in whatever form Boss chooses.
+```
+GET https://ops.jakisai.com/api/business-status
+Authorization: Bearer <same token as /api/status>      # header only, no ?token= form
+```
+
+Live since 2026-10-01. Refreshes every 10 minutes, stale after 30. Same shape as
+`/api/status` — `overall`, `summary`, `counts`, `checks[]` with priorities, `not_covered[]`,
+`how_to_read` — so the agent's existing polling logic applies unchanged.
+
+It reads the dashboard database with SQLite `mode=ro`: writes are refused by the database
+engine, not by convention. There is no session to expire, no password, and no browser
+automation involved.
+
+**The agent should poll both endpoints:** `/api/status` for infrastructure,
+`/api/business-status` for the business. Neither duplicates the other.
+
+The sections below describe what the dashboard holds and which endpoint now surfaces it.
 
 ---
 
