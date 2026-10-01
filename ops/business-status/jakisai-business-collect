@@ -143,6 +143,22 @@ def check_invoices(d):
 
 
 def check_profitability(d):
+    # The app attributes expenses to a client via expenses.client_id. If nothing is
+    # attributed, per-client profit degenerates to revenue and this check would always
+    # report "profitable" — false comfort. Report `unknown` instead and say why.
+    attributed = d.val('SELECT COUNT(*) FROM expenses WHERE client_id IS NOT NULL')
+    if not attributed:
+        total = d.val('SELECT COUNT(*) FROM expenses')
+        add('profitability', 'Client profitability', 2, 'unknown',
+            f'cannot be computed: 0 of {total} expenses are attributed to a client',
+            'expenses carry a client_id so per-client profit is meaningful',
+            warning='any client with revenue is at a loss',
+            details={'expenses_total': total, 'expenses_attributed': 0,
+                     'why': 'Every expense row has client_id NULL, so per-client profit '
+                            'would equal revenue and always look positive. Attribute '
+                            'expenses to clients in the Command Center to make this check '
+                            'meaningful. Until then, treat per-client profit as unknown.'})
+        return
     rows = d.all("""
         SELECT c.id, c.name,
           COALESCE((SELECT SUM(amount) FROM payments p WHERE p.client_id=c.id),0) rev,

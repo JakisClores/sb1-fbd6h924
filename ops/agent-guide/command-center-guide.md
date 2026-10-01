@@ -85,8 +85,15 @@ already written in plain language — quote it rather than paraphrasing.
 
 Normal: `unpaid_invoices` small and shrinking; every active client with positive profit.
 
+> **Measured limitation:** **0 of 33 expenses carry a `client_id`.** Per-client profit
+> therefore equals revenue and would always look positive, so `/api/business-status`
+> reports `profitability` as **`unknown`** rather than giving false comfort. The dashboard's
+> own per-client profit figures have the same blind spot. To make this check meaningful,
+> expenses must be attributed to clients in the Command Center.
+
 Problem worth reporting: a client whose `profitability.profit` goes negative (the health
-check already flags this, `+3`) · an invoice still `unpaid` after its grace period ·
+check already flags this, `+3`, once expenses are attributed) · an invoice still `unpaid`
+after its grace period ·
 `payout_requests` sitting in `pending`, since **only the Owner can approve them** — so a
 pending payout is always blocked on Boss personally.
 
